@@ -857,8 +857,7 @@ json::object asst::CombatRecordRecognitionTask::analyze_action_condition(ClipInf
 size_t asst::CombatRecordRecognitionTask::skip_frames(size_t count)
 {
     for (size_t i = 0; i < count; ++i) {
-        cv::Mat ignore;
-        *m_video_ptr >> ignore;
+        m_video_ptr->grab();
     }
     return count;
 }
