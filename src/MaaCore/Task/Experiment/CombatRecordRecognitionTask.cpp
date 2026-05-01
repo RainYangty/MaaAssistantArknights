@@ -206,7 +206,11 @@ bool asst::CombatRecordRecognitionTask::analyze_stage()
             return false;
         }
 
+        cv::Rect ui_roi(static_cast<int>(m_offset_x), static_cast<int>(m_offset_y), 1280, 720);
+
         cv::resize(frame, frame, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
+
+        frame = frame(ui_roi);
 
         RegionOCRer stage_analyzer(frame);
         stage_analyzer.set_task_info(stage_name_task_ptr);
