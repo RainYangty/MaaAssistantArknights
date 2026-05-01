@@ -61,6 +61,8 @@ private:
     bool process_changes(ClipInfo& clip, ClipInfo* pre_clip_ptr);
     void ananlyze_deployment_names(ClipInfo& clip);
 
+    cv::Mat get_stitched_720p(const cv::Mat& frame);
+
     json::object analyze_action_condition(ClipInfo& clip, ClipInfo* pre_clip_ptr);
     size_t skip_frames(size_t count);
 
@@ -72,6 +74,10 @@ private:
     double m_video_fps = 0;
     size_t m_video_frame_count = 0;
     double m_scale = 0;
+    double m_offset_x = 0;
+    double m_offset_y = 0;
+    double current_ratio = 0;
+    bool is_height_locked = false;
 
     int m_formation_fps = 2;
     int m_stage_ocr_fps = 2;

@@ -50,7 +50,7 @@ bool asst::CombatRecordRecognitionTask::_run()
     double raw_w = m_video_ptr->get(cv::CAP_PROP_FRAME_WIDTH);
     double raw_h = m_video_ptr->get(cv::CAP_PROP_FRAME_HEIGHT);
     const double target_ratio = 1280.0 / 720.0;
-    double current_ratio = raw_w / raw_h;
+    current_ratio = raw_w / raw_h;
     m_scale = WindowWidthDefault / raw_w;
     /*
      用于地图定位，方舟的地图具有如下规律
@@ -146,10 +146,38 @@ bool asst::CombatRecordRecognitionTask::analyze_formation()
             return false;
         }
 
-        cv::Rect ui_roi(static_cast<int>(m_offset_x), static_cast<int>(m_offset_y), 1280, 720);
+        // cv::resize(frame, frame, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
+        int raw_w = frame.cols;
+        int raw_h = frame.rows;
 
-        cv::resize(frame, frame, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
-        frame = frame(ui_roi);
+        double target_ratio = 1280.0 / 720.0;
+        int crop_x, crop_y, crop_w, crop_h;
+
+        if (current_ratio > target_ratio) {
+            // 宽屏的宽度方向需要居中裁掉两边
+            crop_h = raw_h;
+            crop_w = static_cast<int>(std::round(raw_h * target_ratio));
+            crop_x = (raw_w - crop_w) / 2;
+            crop_y = 0;
+        }
+        else {
+            // 窄屏的高度方向需要居中裁掉上下
+            crop_w = raw_w;
+            crop_h = static_cast<int>(std::round(720.0 / m_scale));
+            crop_x = 0;
+            crop_y = static_cast<int>(std::round(m_offset_y / m_scale));
+        }
+
+        // 防止浮点数舍入导致越界 1 像素
+        crop_x = std::clamp(crop_x, 0, raw_w - 1);
+        crop_y = std::clamp(crop_y, 0, raw_h - 1);
+        crop_w = std::clamp(crop_w, 1, raw_w - crop_x);
+        crop_h = std::clamp(crop_h, 1, raw_h - crop_y);
+
+        cv::Rect crop_roi(crop_x, crop_y, crop_w, crop_h);
+
+        frame = frame(crop_roi);
+        cv::resize(frame, frame, cv::Size(1280, 720), 0, 0, cv::INTER_AREA);
 
         formation_ananlyzer.set_image(frame);
         auto formation_opt = formation_ananlyzer.analyze();
@@ -206,11 +234,28 @@ bool asst::CombatRecordRecognitionTask::analyze_stage()
             return false;
         }
 
-        cv::Rect ui_roi(static_cast<int>(m_offset_x), static_cast<int>(m_offset_y), 1280, 720);
+        // cv::Rect ui_roi(static_cast<int>(m_offset_x), static_cast<int>(m_offset_y), 1280, 720);
 
         cv::resize(frame, frame, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
 
-        frame = frame(ui_roi);
+        cv::Mat standard_frame = cv::Mat::zeros(720, 1280, frame.type());
+
+        int src_x = static_cast<int>(std::round(m_offset_x));
+        int src_y = static_cast<int>(std::round(m_offset_y));
+
+        int src_w = std::min(1280, frame.cols - src_x);
+        int src_h = std::min(720, frame.rows - src_y);
+
+        cv::Rect src_roi(src_x, src_y, src_w, src_h);
+
+        int dst_x = (1280 - src_w) / 2;
+        int dst_y = (720 - src_h) / 2;
+
+        cv::Rect dst_roi(dst_x, dst_y, src_w, src_h);
+
+        frame(src_roi).copyTo(standard_frame(dst_roi));
+
+        frame = standard_frame;
 
         RegionOCRer stage_analyzer(frame);
         stage_analyzer.set_task_info(stage_name_task_ptr);
@@ -277,12 +322,34 @@ bool asst::CombatRecordRecognitionTask::analyze_deployment()
 
         cv::resize(frame, frame, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
 
-        oper_analyzer.set_image(frame);
+        cv::Rect ui_roi(0, 0, 1280, std::min(720, frame.rows));
+        cv::Mat frame_pause = frame(ui_roi).clone();
+
+        oper_analyzer.set_image(frame_pause);
         auto oper_result_opt = oper_analyzer.analyze();
         bool analyzed = oper_result_opt && oper_result_opt->pause_button;
         if (analyzed) {
             m_battle_start_frame = i;
-            deployment = std::move(oper_result_opt->deployment);
+
+            // 找到按钮，为匹配干员，重新从底部裁剪
+            int bottom_y = frame.rows - 720;
+
+            if (bottom_y < 0) {
+                // 宽屏补偿
+                cv::copyMakeBorder(frame, frame, std::abs(bottom_y), 0, 0, 0, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+                bottom_y = 0;
+            }
+
+            cv::Rect bottom_roi(0, bottom_y, 1280, 720);
+            cv::Mat standard_bottom_frame = frame(bottom_roi).clone();
+
+            // 重新分析这一帧，获取基于“底部对齐”坐标的 deployment 数据
+            oper_analyzer.set_image(standard_bottom_frame);
+            auto final_oper_opt = oper_analyzer.analyze();
+            if (final_oper_opt) {
+                deployment = std::move(final_oper_opt->deployment);
+            }
+
             break;
         }
     }
@@ -375,9 +442,11 @@ bool asst::CombatRecordRecognitionTask::slice_video()
             battle_over();
             break;
         }
-        cv::resize(frame, frame, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
+        // cv::resize(frame, frame, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
 
-        BattlefieldMatcher analyzer(frame);
+        cv::Mat standard_frame = get_stitched_720p(frame);
+
+        BattlefieldMatcher analyzer(standard_frame);
         analyzer.set_object_of_interest(
             {
                 .deployment = true,
@@ -564,7 +633,14 @@ bool asst::CombatRecordRecognitionTask::compare_skill(ClipInfo& clip, ClipInfo& 
         return false;
     }
     cv::resize(frame, frame, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
+
+    double h_current = frame.rows;
+    int mapped_y = static_cast<int>(std::round(h_current / 2.0 + target_position.y - 360.0));
+
+    Point actual_target_point { target_position.x, mapped_y };
+
     analyzer.set_image(frame);
+    analyzer.set_base_point(actual_target_point);
     bool cur_ready = analyzer.analyze()->skill_ready.ready;
 
     if (pre_ready && !cur_ready) {
@@ -624,6 +700,11 @@ bool asst::CombatRecordRecognitionTask::detect_operators(ClipInfo& clip, [[maybe
         auto tiles = m_normal_tile_info | std::views::values;
         for (const auto& box : result_opt->operators) {
             Rect rect = box.rect.move(det_box_move);
+
+            /*考虑缩放和偏移*/
+            rect.x -= static_cast<int>(m_offset_x);
+            rect.y -= static_cast<int>(m_offset_y);
+
             auto iter = std::ranges::find_if(tiles, [&](const TilePack::TileInfo& t) { return rect.include(t.pos); });
             if (iter == tiles.end()) {
                 Log.warn(i, __FUNCTION__, "no pos", box.rect.to_string(), rect);
@@ -685,6 +766,10 @@ bool asst::CombatRecordRecognitionTask::classify_direction(ClipInfo& clip, ClipI
         BattlefieldClassifier analyzer(frame);
         analyzer.set_object_of_interest({ .skill_ready = false, .deploy_direction = true });
         for (const auto& loc : newcomer) {
+            const auto& base_pos = m_normal_tile_info.at(loc).pos;
+            Point actual_target_point { static_cast<int>(std::round(base_pos.x + m_offset_x)),
+                                        static_cast<int>(std::round(base_pos.y + m_offset_y)) };
+
             analyzer.set_base_point(m_normal_tile_info.at(loc).pos);
             auto result_opt = analyzer.analyze();
             for (size_t i = 0; i < ClsSize; ++i) {
@@ -918,4 +1003,37 @@ std::string asst::CombatRecordRecognitionTask::analyze_detail_page_oper_name(con
     const auto& det_name = det_result_opt->front().text;
 
     return BattleData.is_name_invalid(det_name) ? std::string() : det_name;
+}
+
+/*什么奇技淫巧艹*/
+cv::Mat asst::CombatRecordRecognitionTask::get_stitched_720p(const cv::Mat& frame)
+{
+    cv::Mat resized;
+    cv::resize(frame, resized, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
+
+    int h = resized.rows;
+    cv::Mat stitched = cv::Mat::zeros(720, 1280, resized.type());
+
+    if (h < 720) {
+        // 高度不足 720（如 21:9）
+        // 对半切开，分别贴在 720P 画布的最顶和最底
+        int half_h = h / 2;
+        cv::Mat top_part = resized(cv::Rect(0, 0, 1280, half_h));
+        cv::Mat bottom_part = resized(cv::Rect(0, h - (h - half_h), 1280, h - half_h));
+
+        top_part.copyTo(stitched(cv::Rect(0, 0, 1280, top_part.rows)));
+        bottom_part.copyTo(stitched(cv::Rect(0, 720 - bottom_part.rows, 1280, bottom_part.rows)));
+    }
+    else {
+        // 高度超过 720（如 4:3）
+        // 上下各保留 360 像素，强行拼成 720
+        cv::Mat top_360 = resized(cv::Rect(0, 0, 1280, 360));
+        cv::Mat bottom_360 = resized(cv::Rect(0, h - 360, 1280, 360));
+
+        top_360.copyTo(stitched(cv::Rect(0, 0, 1280, 360)));
+        bottom_360.copyTo(stitched(cv::Rect(0, 360, 1280, 360)));
+    }
+    // 返回前让我先笑会hhhhhhh
+
+    return stitched;
 }
