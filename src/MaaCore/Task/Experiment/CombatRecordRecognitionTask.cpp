@@ -46,7 +46,31 @@ bool asst::CombatRecordRecognitionTask::_run()
     m_video_fps = m_video_ptr->get(cv::CAP_PROP_FPS);
     m_video_frame_count = static_cast<size_t>(m_video_ptr->get(cv::CAP_PROP_FRAME_COUNT));
     m_battle_start_frame = 0;
-    m_scale = WindowHeightDefault / m_video_ptr->get(cv::CAP_PROP_FRAME_HEIGHT);
+    //m_scale = WindowHeightDefault / m_video_ptr->get(cv::CAP_PROP_FRAME_HEIGHT);
+    double raw_w = m_video_ptr->get(cv::CAP_PROP_FRAME_WIDTH);
+    double raw_h = m_video_ptr->get(cv::CAP_PROP_FRAME_HEIGHT);
+    const double target_ratio = 1280.0 / 720.0;
+    double current_ratio = raw_w / raw_h;
+    m_scale = WindowWidthDefault / raw_w;
+    /*
+     用于地图定位，方舟的地图具有如下规律
+     1. 不论长宽，哪边过大就对齐另外一边，比如21:9就将高度锁定在720，9:21，就把宽度锁定在1280
+     2.锁定后，锁定的边ROI坐标不用变，另一边用中心减去对应坐标
+     如2746*1908的就锁定宽（因为高过高），成为1280*889.38，那么获取的坐标比如是(a,b)a是水平，b是竖直，那么映射之后应该是(a, 889.38/2+b-720/2)
+    */
+    if (current_ratio > target_ratio) {
+        // 若锁定高度为 720
+        is_height_locked = true;
+        m_offset_x = (raw_w * m_scale - 1280.0) / 2.0;
+        m_offset_y = 0;
+    }
+    else {
+        // 若锁定宽度为 1280
+        m_offset_x = 0;
+        m_offset_y = (raw_h * m_scale - 720.0) / 2.0;
+    }
+
+    Log.info("Adaptive Scaling | Scale:", m_scale, "Offset_X:", m_offset_x, "Offset_Y:", m_offset_y);
 
     if (!analyze_formation()) {
         Log.error(__FUNCTION__, "failed to analyze formation");
@@ -122,7 +146,10 @@ bool asst::CombatRecordRecognitionTask::analyze_formation()
             return false;
         }
 
+        cv::Rect ui_roi(static_cast<int>(m_offset_x), static_cast<int>(m_offset_y), 1280, 720);
+
         cv::resize(frame, frame, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
+        frame = frame(ui_roi);
 
         formation_ananlyzer.set_image(frame);
         auto formation_opt = formation_ananlyzer.analyze();
