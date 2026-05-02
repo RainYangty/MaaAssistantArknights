@@ -74,6 +74,7 @@ private:
     double m_video_fps = 0;
     size_t m_video_frame_count = 0;
     double m_scale = 0;
+    double dectect_scale = 0;
     double m_offset_x = 0;
     double m_offset_y = 0;
     double current_ratio = 0;
