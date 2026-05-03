@@ -51,7 +51,7 @@ bool asst::CombatRecordRecognitionTask::_run()
     m_video_fps = m_video_ptr->get(cv::CAP_PROP_FPS);
     m_video_frame_count = static_cast<size_t>(m_video_ptr->get(cv::CAP_PROP_FRAME_COUNT));
     m_battle_start_frame = 0;
-    //m_scale = WindowHeightDefault / m_video_ptr->get(cv::CAP_PROP_FRAME_HEIGHT);
+    // m_scale = WindowHeightDefault / m_video_ptr->get(cv::CAP_PROP_FRAME_HEIGHT);
     double raw_w = m_video_ptr->get(cv::CAP_PROP_FRAME_WIDTH);
     double raw_h = m_video_ptr->get(cv::CAP_PROP_FRAME_HEIGHT);
     const double target_ratio = 1280.0 / 720.0;
@@ -61,7 +61,8 @@ bool asst::CombatRecordRecognitionTask::_run()
      用于地图定位，方舟的地图具有如下规律
      1. 不论长宽，哪边过大就对齐另外一边，比如21:9就将高度锁定在720，9:21，就把宽度锁定在1280
      2.锁定后，锁定的边ROI坐标不用变，另一边用中心减去对应坐标
-     如2746*1908的就锁定宽（因为高过高），成为1280*889.38，那么获取的坐标比如是(a,b)a是水平，b是竖直，那么映射之后应该是(a, 889.38/2+b-720/2)
+     如2746*1908的就锁定宽（因为高过高），成为1280*889.38，那么获取的坐标比如是(a,b)a是水平，b是竖直，那么映射之后应该是(a,
+     889.38/2+b-720/2)
     */
     if (current_ratio > target_ratio) {
         // 若锁定高度为 720
@@ -319,7 +320,7 @@ bool asst::CombatRecordRecognitionTask::analyze_deployment()
 
     std::vector<battle::DeploymentOper> deployment;
 
-    double x_compress_factor = 1.0;
+    // double x_compress_factor = 1.0;
     for (size_t i = m_stage_ocr_end_frame; i < m_video_frame_count; i += skip_frames(skip_count) + 1) {
         cv::Mat frame;
         *m_video_ptr >> frame;
@@ -329,10 +330,12 @@ bool asst::CombatRecordRecognitionTask::analyze_deployment()
             return false;
         }
 
-        cv::resize(frame, frame, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
+        cv::Mat frame_pause = frame.clone();
 
-        cv::Rect ui_roi(0, 0, 1280, std::min(720, frame.rows));
-        cv::Mat frame_pause = frame(ui_roi).clone();
+        cv::resize(frame_pause, frame_pause, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
+
+        cv::Rect ui_roi(0, 0, 1280, std::min(720, frame_pause.rows));
+        frame_pause = frame_pause(ui_roi);
 
         oper_analyzer.set_image(frame_pause);
         auto oper_result_opt = oper_analyzer.analyze();
@@ -340,65 +343,97 @@ bool asst::CombatRecordRecognitionTask::analyze_deployment()
         if (analyzed) {
             m_battle_start_frame = i;
 
+            // 自适应比例的干员识别
+            // double current_ratio = static_cast<double>(frame.cols) / frame.rows;
             double target_ratio = 1280.0 / 720.0;
 
-            cv::Mat standard_bottom_frame;
+            if (current_ratio <= target_ratio) {
+                // 窄屏 按宽度 1280 等比缩放，然后从下往上截取 720 高度
+                double scale_1280 = 1280.0 / frame.cols;
+                cv::Mat narrow_standard_frame;
+                cv::resize(frame, narrow_standard_frame, cv::Size(), scale_1280, scale_1280, cv::INTER_AREA);
 
-            // 找到按钮，为匹配干员，重新从底部裁剪
-            if (current_ratio > target_ratio) {
-                // 【宽屏方案】：保证高度 720，宽度强压到 1280，不裁切
-                cv::resize(frame, standard_bottom_frame, cv::Size(1280, 720), 0, 0, cv::INTER_AREA);
+                int crop_y = std::max(0, narrow_standard_frame.rows - 720);
+                cv::Rect bottom_roi(0, crop_y, 1280, std::min(720, narrow_standard_frame.rows));
+                cv::Mat final_frame = narrow_standard_frame(bottom_roi);
 
-                // 计算挤压系数：目标比例 / 当前比例
-                // 比如 21:9 压到 16:9，系数约为 0.76 (即宽度被压缩到了原来的 76%)
-                x_compress_factor = target_ratio / current_ratio;
+                oper_analyzer.set_image(final_frame);
+                auto final_oper_opt = oper_analyzer.analyze();
+                if (final_oper_opt) {
+                    deployment = std::move(final_oper_opt->deployment);
+                }
             }
             else {
-                // 【窄屏方案】：底部对齐补黑
-                int bottom_y = frame.rows - 720;
-                if (bottom_y < 0) {
-                    cv::copyMakeBorder(
-                        frame,
-                        frame,
-                        std::abs(bottom_y),
-                        0,
-                        0,
-                        0,
-                        cv::BORDER_CONSTANT,
-                        cv::Scalar(0, 0, 0));
-                    bottom_y = 0;
+                // 宽屏 按高度 720 等比缩放
+                double scale_720 = 720.0 / frame.rows;
+                cv::Mat wide_standard_frame;
+                cv::resize(frame, wide_standard_frame, cv::Size(), scale_720, scale_720, cv::INTER_AREA);
+
+                int width = wide_standard_frame.cols;
+
+                // 宽屏：切割为左右两段 1280x720 进行检测
+                cv::Rect left_roi(0, 0, 1280, 720);
+                int right_offset_x = width - 1280;
+                cv::Rect right_roi(right_offset_x, 0, 1280, 720);
+
+                // 识别左半边
+                oper_analyzer.set_image(wide_standard_frame(left_roi));
+                std::vector<battle::DeploymentOper> left_opers;
+                if (auto left_opt = oper_analyzer.analyze()) {
+                    left_opers = std::move(left_opt->deployment);
                 }
-                cv::Rect bottom_roi(0, bottom_y, 1280, 720);
-                standard_bottom_frame = frame(bottom_roi).clone();
-            }
-            // cv::Mat standard_bottom_frame = frame(bottom_roi).clone();
 
-            // 重新分析这一帧，获取基于“底部对齐”坐标的 deployment 数据
-            oper_analyzer.set_image(standard_bottom_frame);
-            auto final_oper_opt = oper_analyzer.analyze();
-            if (final_oper_opt) {
-                deployment = std::move(final_oper_opt->deployment);
+                // 识别右半边
+                oper_analyzer.set_image(wide_standard_frame(right_roi));
+                std::vector<battle::DeploymentOper> right_opers;
+                if (auto right_opt = oper_analyzer.analyze()) {
+                    right_opers = std::move(right_opt->deployment);
+                }
+
+                // 将右半边的干员坐标还原到宽图的绝对坐标系
+                for (auto& oper : right_opers) {
+                    oper.rect.x += right_offset_x;
+                }
+
+                // 去重并合并
+                deployment = std::move(left_opers);
+                const int duplicate_threshold_x = 50; // 同一干员X坐标偏差容忍度
+
+                for (auto& r_oper : right_opers) {
+                    bool is_duplicate = false;
+                    for (const auto& l_oper : deployment) {
+                        if (std::abs(r_oper.rect.x - l_oper.rect.x) < duplicate_threshold_x) {
+                            is_duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!is_duplicate) {
+                        deployment.push_back(std::move(r_oper));
+                    }
+                }
+
+                // 重新从左到右排序
+                std::sort(
+                    deployment.begin(),
+                    deployment.end(),
+                    [](const battle::DeploymentOper& a, const battle::DeploymentOper& b) {
+                        return a.rect.x < b.rect.x;
+                    });
+
+                // 重建正确的索引
+                size_t new_index = 0;
+                for (auto& oper : deployment) {
+                    oper.index = new_index++;
+                }
             }
 
-            break;
+            break; // 成功解析出开始帧和 deployment，跳出循环
         }
     }
 
     auto avatar_task_ptr = Task.get("BattleAvatarDataForFormation");
     for (const auto& [name, formation_avatar] : m_formation) {
         cv::Mat target_formation_avatar = formation_avatar.clone();
-        
-        // 对于宽屏视频，底部被压缩了，所以编队界面的干员头像也要相应压缩一下，才能和后续匹配的待部署区干员头像在同一坐标系下
-        if (x_compress_factor < 0.99) {
-            cv::resize(
-                target_formation_avatar,
-                target_formation_avatar,
-                cv::Size(),
-                x_compress_factor,
-                1.0,
-                cv::INTER_AREA);
-        }
-
 
         BestMatcher best_match_analyzer(target_formation_avatar);
         best_match_analyzer.set_task_info(avatar_task_ptr);
@@ -479,7 +514,6 @@ bool asst::CombatRecordRecognitionTask::slice_video()
     };
     for (; i < ends; i += skip_frames(skip_count) + 1, pre_frame = frame) {
         cv::Mat temp;
-        // 这里如果不用temp，frame的所有权会出错
         *m_video_ptr >> temp;
         frame = temp;
         if (frame.empty()) {
@@ -487,22 +521,15 @@ bool asst::CombatRecordRecognitionTask::slice_video()
             battle_over();
             break;
         }
-        // cv::resize(frame, frame, cv::Size(), m_scale, m_scale, cv::INTER_AREA);
 
+        // 使用拼图识别击杀数、按钮
         cv::Mat standard_frame = get_stitched_720p(frame);
+        BattlefieldMatcher ui_analyzer(standard_frame);
+        ui_analyzer.set_object_of_interest({ .kills = true, .speed_button = true });
+        ui_analyzer.set_total_kills_prompt(total_kills);
+        auto ui_result_opt = ui_analyzer.analyze();
 
-        BattlefieldMatcher analyzer(standard_frame);
-        analyzer.set_object_of_interest(
-            {
-                .deployment = true,
-                .kills = true,
-                .speed_button = true,
-            });
-
-        analyzer.set_total_kills_prompt(total_kills);
-        auto result_opt = analyzer.analyze();
-
-        if (!result_opt) {
+        if (!ui_result_opt) {
             battle_over();
             if (++not_in_battle_count > 10) {
                 break;
@@ -512,8 +539,77 @@ bool asst::CombatRecordRecognitionTask::slice_video()
         m_battle_end_frame = 0;
         not_in_battle_count = 0;
 
-        if (result_opt->kills.status == BattlefieldMatcher::MatchStatus::Success) {
-            auto& [cur_kills, cur_total_kills] = result_opt->kills.value;
+        // --- 2. 干员轨道：使用自适应逻辑识别底部栏 ---
+        std::vector<battle::DeploymentOper> cur_opers;
+        BattlefieldMatcher oper_analyzer;
+        oper_analyzer.set_object_of_interest({ .deployment = true });
+
+        double target_ratio = 1280.0 / 720.0;
+        if (current_ratio <= target_ratio)
+        {
+            // 【窄屏】从下往上截取识别
+            double scale_1280 = 1280.0 / frame.cols;
+            cv::Mat narrow_standard_frame;
+            cv::resize(frame, narrow_standard_frame, cv::Size(), scale_1280, scale_1280, cv::INTER_AREA);
+
+            int crop_y = std::max(0, narrow_standard_frame.rows - 720);
+            cv::Rect bottom_roi(0, crop_y, 1280, std::min(720, narrow_standard_frame.rows));
+
+            oper_analyzer.set_image(narrow_standard_frame(bottom_roi));
+            if (auto opt = oper_analyzer.analyze()) {
+                cur_opers = std::move(opt->deployment);
+            }
+        }
+        else
+        {
+            // 【宽屏】分段滑动窗口识别
+            double scale_720 = 720.0 / frame.rows;
+            cv::Mat wide_standard_frame;
+            cv::resize(frame, wide_standard_frame, cv::Size(), scale_720, scale_720, cv::INTER_AREA);
+
+            int width = wide_standard_frame.cols;
+            cv::Rect left_roi(0, 0, 1280, 720);
+            int right_offset_x = width - 1280;
+            cv::Rect right_roi(right_offset_x, 0, 1280, 720);
+
+            // 左半边
+            oper_analyzer.set_image(wide_standard_frame(left_roi));
+            if (auto left_opt = oper_analyzer.analyze()) {
+                cur_opers = std::move(left_opt->deployment);
+            }
+            // 右半边
+            oper_analyzer.set_image(wide_standard_frame(right_roi));
+            if (auto right_opt = oper_analyzer.analyze()) {
+                auto right_opers = std::move(right_opt->deployment);
+                // 坐标还原与合并去重
+                for (auto& oper : right_opers) {
+                    oper.rect.x += right_offset_x;
+                    bool is_duplicate = false;
+                    for (const auto& l_oper : cur_opers) {
+                        if (std::abs(oper.rect.x - l_oper.rect.x) < 50) {
+                            is_duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!is_duplicate) {
+                        cur_opers.push_back(std::move(oper));
+                    }
+                }
+            }
+            // 排序与索引重构
+            std::sort(cur_opers.begin(), cur_opers.end(), [](const auto& a, const auto& b) {
+                return a.rect.x < b.rect.x;
+            });
+            for (size_t idx = 0; idx < cur_opers.size(); ++idx) {
+                cur_opers[idx].index = idx;
+            }
+        }
+
+        // 结合两路识别结果
+
+        // 更新击杀数
+        if (ui_result_opt->kills.status == BattlefieldMatcher::MatchStatus::Success) {
+            auto& [cur_kills, cur_total_kills] = ui_result_opt->kills.value;
             if (cur_kills != latest_kills) {
                 m_frame_kills.emplace_back(std::make_pair(i, cur_kills));
             }
@@ -521,21 +617,20 @@ bool asst::CombatRecordRecognitionTask::slice_video()
             total_kills = cur_total_kills;
         }
 
-        const auto& cur_opers = result_opt->deployment;
+        // 连贯性校验
         bool continuity = true;
         int pre_distance = 0;
-        for (auto iter = cur_opers.begin(); iter != cur_opers.end(); ++iter) {
-            if (iter == cur_opers.begin()) {
-                continue;
-            }
-            int distance = std::abs(iter->rect.x - (iter - 1)->rect.x);
+        for (size_t idx = 1; idx < cur_opers.size(); ++idx) {
+            int distance = std::abs(cur_opers[idx].rect.x - cur_opers[idx - 1].rect.x);
             if (pre_distance && std::abs(distance - pre_distance) > 5) {
                 continuity = false;
+                break;
             }
             pre_distance = distance;
         }
 
-        bool oper_is_clicked = !result_opt->speed_button || !result_opt->pause_button;
+        // 状态判定
+        bool oper_is_clicked = !ui_result_opt->speed_button || !ui_result_opt->pause_button;
         bool oper_auto_retreat =
             in_segment && continuity && !m_clips.empty() && cur_opers.size() != m_clips.back().deployment.size();
 
@@ -553,7 +648,6 @@ bool asst::CombatRecordRecognitionTask::slice_video()
             pre_clip.end_frame_index = i - skip_count;
             pre_clip.end_frame = pre_frame;
             in_segment = false;
-
             continue;
         }
         else if (!continuity) {
@@ -562,12 +656,11 @@ bool asst::CombatRecordRecognitionTask::slice_video()
         }
         else if (!in_segment) {
             ClipInfo info;
-            info.start_frame_index = i; // 后处理会加个 offset
+            info.start_frame_index = i;
             info.end_frame_index = i;
-            info.deployment = cur_opers;
+            info.deployment = cur_opers; // 存入精准的干员列表
             info.start_frame = frame;
             m_clips.emplace_back(std::move(info));
-
             in_segment = true;
         }
     }
@@ -735,9 +828,9 @@ bool asst::CombatRecordRecognitionTask::detect_operators(ClipInfo& clip, [[maybe
             callback(AsstMsg::SubTaskError, basic_info_with_what("DetectOperators"));
             return false;
         }
-        
+
         cv::resize(frame, frame, cv::Size(), dectect_scale, dectect_scale, cv::INTER_AREA);
-        
+
         int x_start = (frame.cols - 1280) / 2;
         int y_start = (frame.rows - 720) / 2;
 
@@ -1088,7 +1181,7 @@ cv::Mat asst::CombatRecordRecognitionTask::get_stitched_720p(const cv::Mat& fram
         cv::Mat right_part =
             resized(cv::Rect(right_start, 0, right_w, 575) & cv::Rect(0, 0, resized.cols, 575)).clone();
 
-        // 底部保留区：需要压缩
+        // 底部保留区：需要压缩(这里不需要了，但是懒得改了)
         int bottom_start = 575;
         int bottom_h = 720 - bottom_start;
         cv::Mat bottom_part = resized(cv::Rect(0, bottom_start, new_w, bottom_h)).clone();
