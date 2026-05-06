@@ -72,10 +72,15 @@ public class VersionUpdateDialogViewModel : Screen
         return Regex.Replace(text, @"([^\[`]|^)@([^\s]+)", "$1[@$2](https://github.com/$2)");
     }
 
-    private readonly string _curVersion = Marshal.PtrToStringAnsi(MaaService.AsstGetVersion()) ?? "0.0.1";
+    private readonly string _curVersion = FakeUpdateHelper.IsEnabled
+        ? FakeUpdateHelper.CurrentVersion
+        : Marshal.PtrToStringAnsi(MaaService.AsstGetVersion()) ?? "0.0.1";
+
     private string _latestVersion = string.Empty;
 
-    private string _updateTag = ConfigurationHelper.GetGlobalValue(ConfigurationKeys.VersionName, string.Empty);
+    private string _updateTag = FakeUpdateHelper.IsEnabled
+        ? FakeUpdateHelper.TargetVersion
+        : ConfigurationHelper.GetGlobalValue(ConfigurationKeys.VersionName, string.Empty);
 
     /// <summary>
     /// Gets or sets the update tag.
@@ -89,7 +94,9 @@ public class VersionUpdateDialogViewModel : Screen
         }
     }
 
-    private string _updateInfo = ConfigurationHelper.GetGlobalValue(ConfigurationKeys.VersionUpdateBody, string.Empty);
+    private string _updateInfo = FakeUpdateHelper.IsEnabled && !string.IsNullOrWhiteSpace(FakeUpdateHelper.UpdateInfo)
+        ? FakeUpdateHelper.UpdateInfo
+        : ConfigurationHelper.GetGlobalValue(ConfigurationKeys.VersionUpdateBody, string.Empty);
 
     // private static readonly MarkdownPipeline s_markdownPipeline = new MarkdownPipelineBuilder().UseXamlSupportedExtensions().Build();
 
@@ -179,6 +186,7 @@ public class VersionUpdateDialogViewModel : Screen
     private string? _mirrorcDownloadUrl;
     private string? _mirrorcVersionName;
     private string? _mirrorcReleaseNote;
+    private bool _requiresFullPackageConfirmation;
 
     public static bool HasPendingUpdatePackage()
     {
@@ -359,6 +367,11 @@ public class VersionUpdateDialogViewModel : Screen
         {
             SettingsViewModel.VersionUpdateSettings.IsCheckingForUpdates = true;
 
+            if (FakeUpdateHelper.IsEnabled)
+            {
+                return await HandleFakeUpdate();
+            }
+
             var (checkRet, source) = await CheckUpdate();
 
             if (checkRet != CheckUpdateRetT.OK)
@@ -376,6 +389,90 @@ public class VersionUpdateDialogViewModel : Screen
         {
             SettingsViewModel.VersionUpdateSettings.IsCheckingForUpdates = false;
         }
+    }
+
+    private async Task<CheckUpdateRetT> HandleFakeUpdate()
+    {
+        const double MinimumDetectedNewVersionDisplaySeconds = 0.5d;
+
+        UpdateTag = FakeUpdateHelper.TargetVersion;
+        if (!string.IsNullOrWhiteSpace(FakeUpdateHelper.UpdateInfo))
+        {
+            UpdateInfo = FakeUpdateHelper.UpdateInfo;
+        }
+
+        UpdatePackageName = "MirrorChyanApp" + UpdateTag + ".zip";
+
+        SettingsViewModel.VersionUpdateSettings.NewVersionFoundInfo = FakeUpdateHelper.HasPendingFakeUpdate
+            ? $"{LocalizationHelper.GetString("NewVersionFoundTitle")}: {UpdateTag}"
+            : string.Empty;
+
+        if (!FakeUpdateHelper.HasPendingFakeUpdate)
+        {
+            return CheckUpdateRetT.AlreadyLatest;
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(MinimumDetectedNewVersionDisplaySeconds));
+        await SimulateMirrorChyanDownloadAsync();
+
+        return CheckUpdateRetT.OK;
+    }
+
+    private static async Task SimulateMirrorChyanDownloadAsync()
+    {
+        const long MinPackageSizeMiB = 20;
+        const long MaxPackageSizeMiB = 80;
+        const long BytesPerMiB = 1024 * 1024;
+        const double GigabitBytesPerSecond = 1_000_000_000d / 8d;
+        const double LogUpdateIntervalSeconds = 1d;
+        const double MinimumDownloadDisplaySeconds = 0.5d;
+        const double MinSpeedFactor = 0.25d;
+        const double MaxSpeedFactor = 1.20d;
+        const double MaxSpeedFactorStepDelta = 0.22d;
+
+        long totalBytes = Random.Shared.NextInt64(MinPackageSizeMiB * BytesPerMiB, (MaxPackageSizeMiB * BytesPerMiB) + 1);
+
+        OutputDownloadProgress(LocalizationHelper.GetString("NewVersionDownloadPreparing"), downloading: false, globalSource: false);
+
+        long downloadedBytes = 0;
+        double speedFactor = 1d + ((Random.Shared.NextDouble() - 0.5d) * 0.24d);
+        bool hasReportedProgress = false;
+        while (downloadedBytes < totalBytes)
+        {
+            speedFactor = Math.Clamp(
+                speedFactor + ((Random.Shared.NextDouble() - 0.5d) * MaxSpeedFactorStepDelta * 2d),
+                MinSpeedFactor,
+                MaxSpeedFactor);
+
+            double bytesPerSecond = GigabitBytesPerSecond * speedFactor;
+            long remainingBytes = totalBytes - downloadedBytes;
+            double remainingSeconds = remainingBytes / bytesPerSecond;
+            double currentIntervalSeconds;
+
+            if (!hasReportedProgress)
+            {
+                currentIntervalSeconds = Math.Max(MinimumDownloadDisplaySeconds, Math.Min(LogUpdateIntervalSeconds, remainingSeconds));
+            }
+            else
+            {
+                currentIntervalSeconds = Math.Min(LogUpdateIntervalSeconds, remainingSeconds);
+            }
+
+            long currentChunk = Math.Min(
+                remainingBytes,
+                Math.Max(1L, (long)Math.Round(bytesPerSecond * currentIntervalSeconds)));
+            long currentValue = downloadedBytes + currentChunk;
+
+            await Task.Delay(TimeSpan.FromSeconds(currentIntervalSeconds));
+
+            OutputDownloadProgress(currentValue, totalBytes, (int)currentChunk, currentIntervalSeconds);
+
+            downloadedBytes = currentValue;
+            hasReportedProgress = true;
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(MinimumDownloadDisplaySeconds));
+        OutputDownloadProgress(downloading: false, output: LocalizationHelper.GetString("NewVersionDownloadCompletedTitle"));
     }
 
     private async Task<CheckUpdateRetT> HandleUpdateFromMaaApi()
@@ -415,6 +512,14 @@ public class VersionUpdateDialogViewModel : Screen
         if (_assetsObject == null)
         {
             return CheckUpdateRetT.FailedToGetInfo;
+        }
+
+        string plannedPackagePath = GetPlannedUpdatePackagePath(UpdatePackageName);
+        if (_requiresFullPackageConfirmation && !ConfirmFullPackageUpdate(plannedPackagePath))
+        {
+            _logger.Information("Full package download canceled by user before download: {PackagePath}", plannedPackagePath);
+            OutputDownloadProgress(string.Empty, downloading: false);
+            return CheckUpdateRetT.NoNeedToUpdate;
         }
 
         string? rawUrl = _assetsObject["browser_download_url"]?.ToString();
@@ -592,6 +697,14 @@ public class VersionUpdateDialogViewModel : Screen
         }
 
         UpdatePackageName = "MirrorChyanApp" + _mirrorcVersionName + ".zip";
+        string plannedPackagePath = GetPlannedUpdatePackagePath(UpdatePackageName);
+        if (_requiresFullPackageConfirmation && !ConfirmFullPackageUpdate(plannedPackagePath))
+        {
+            _logger.Information("MirrorChyan full package download canceled by user before download: {PackagePath}", plannedPackagePath);
+            OutputDownloadProgress(string.Empty, downloading: false);
+            return CheckUpdateRetT.NoNeedToUpdate;
+        }
+
         var downloaded = await DownloadFromMirrorChyan(_mirrorcDownloadUrl,
                     UpdatePackageName);
 
@@ -629,10 +742,35 @@ public class VersionUpdateDialogViewModel : Screen
             LocalizationHelper.GetString("LocalUpdatePackageImportedTitle"));
     }
 
+    public static bool ConfirmFullPackageUpdate(string packagePath)
+    {
+        string baseDir = Path.GetFullPath(PathsHelper.BaseDir);
+        string normalizedPackagePath = Path.IsPathRooted(packagePath)
+            ? Path.GetFullPath(packagePath)
+            : GetPlannedUpdatePackagePath(packagePath);
+
+        MessageBoxResult result = MessageBoxHelper.Show(
+            string.Format(LocalizationHelper.GetString("PendingFullUpdateManualConfirmDesc"), baseDir, normalizedPackagePath),
+            LocalizationHelper.GetString("PendingFullUpdateManualConfirmTitle"),
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning,
+            yes: LocalizationHelper.GetString("PendingFullUpdateManualConfirmYes"),
+            no: LocalizationHelper.GetString("PendingFullUpdateManualConfirmNo"));
+
+        return result == MessageBoxResult.Yes;
+    }
+
     private async Task AskToRestartCore(string description, string title)
     {
         if (SettingsViewModel.VersionUpdateSettings.AutoInstallUpdatePackage)
         {
+            if (FakeUpdateHelper.HasPendingFakeUpdate)
+            {
+                await _runningState.UntilIdleAsync(1000);
+                _ = FakeUpdateHelper.Updating();
+                return;
+            }
+
             await Bootstrapper.RestartAfterIdleAsync();
             return;
         }
@@ -648,6 +786,12 @@ public class VersionUpdateDialogViewModel : Screen
             cancel: LocalizationHelper.GetString("ManualRestart"));
         if (result == MessageBoxResult.OK)
         {
+            if (FakeUpdateHelper.HasPendingFakeUpdate)
+            {
+                _ = FakeUpdateHelper.Updating();
+                return;
+            }
+
             Bootstrapper.ShutdownAndRestartWithoutArgs();
         }
     }
@@ -722,6 +866,8 @@ public class VersionUpdateDialogViewModel : Screen
 
     private async Task<CheckUpdateRetT> GetVersionDetailsByMaaApi(string versionType)
     {
+        _requiresFullPackageConfirmation = false;
+
         var (_, json) = await Instances.MaaApiService.RequestMaaApiWithCache($"version/{versionType}.json", false);
         if (json is null)
         {
@@ -786,6 +932,7 @@ public class VersionUpdateDialogViewModel : Screen
         if (_assetsObject == null && fullPackage != null && SettingsViewModel.VersionUpdateSettings.AutoDownloadUpdatePackage)
         {
             _assetsObject = fullPackage;
+            _requiresFullPackageConfirmation = true;
             _logger.Warning("No OTA package found, but full package found.");
             using var toast = new ToastNotification(LocalizationHelper.GetString("NewVersionNoOtaPackage"));
             toast.Show(30);
@@ -797,6 +944,8 @@ public class VersionUpdateDialogViewModel : Screen
 
     private async Task<CheckUpdateRetT> CheckUpdateByMirrorChyan()
     {
+        _requiresFullPackageConfirmation = false;
+
         var cdk = SettingsViewModel.VersionUpdateSettings.MirrorChyanCdk.Trim();
         var arch = IsArm ? "arm64" : "x64";
         string channel = SettingsViewModel.VersionUpdateSettings.VersionType switch {
@@ -921,12 +1070,17 @@ public class VersionUpdateDialogViewModel : Screen
             return CheckUpdateRetT.AlreadyLatest;
         }
 
-        if (data["data"]?["update_type"]?.ToObject<string>() == "full" && SettingsViewModel.VersionUpdateSettings.AutoDownloadUpdatePackage)
+        if (data["data"]?["update_type"]?.ToObject<string>() == "full")
         {
-            using var toast = new ToastNotification(LocalizationHelper.GetString("NewVersionNoOtaPackage"));
-            toast.Show(30);
-            _logger.Warning("No OTA package found, but full package found.");
-            Instances.TaskQueueViewModel.AddLog(LocalizationHelper.GetString("NewVersionNoOtaPackage"), UiLogColor.Warning);
+            _requiresFullPackageConfirmation = true;
+
+            if (SettingsViewModel.VersionUpdateSettings.AutoDownloadUpdatePackage)
+            {
+                using var toast = new ToastNotification(LocalizationHelper.GetString("NewVersionNoOtaPackage"));
+                toast.Show(30);
+                _logger.Warning("No OTA package found, but full package found.");
+                Instances.TaskQueueViewModel.AddLog(LocalizationHelper.GetString("NewVersionNoOtaPackage"), UiLogColor.Warning);
+            }
         }
 
         // 到这里已经确定有新版本了
@@ -960,6 +1114,11 @@ public class VersionUpdateDialogViewModel : Screen
         }
 
         return string.CompareOrdinal(_curVersion, latestVersion) < 0;
+    }
+
+    private static string GetPlannedUpdatePackagePath(string packageName)
+    {
+        return Path.GetFullPath(Path.Combine(PathsHelper.BaseDir, packageName));
     }
 
     /// <summary>

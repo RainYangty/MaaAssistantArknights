@@ -122,7 +122,9 @@ public class RootViewModel : Conductor<Screen>.Collection.OneActive
         set => SetAndNotify(ref _windowTitle, value);
     }
 
-    private string _windowVersionUpdateInfo = string.Empty;
+    private string _windowVersionUpdateInfo = FakeUpdateHelper.HasPendingFakeUpdate
+        ? $"{LocalizationHelper.GetString("NewVersionFoundTitle")}: {FakeUpdateHelper.TargetVersion}"
+        : string.Empty;
 
     /// <summary>
     /// Gets or sets the version update info.
@@ -300,7 +302,21 @@ public class RootViewModel : Conductor<Screen>.Collection.OneActive
             ? "arm64"
             : "x64";
 
-        var importResult = PendingUpdateApplier.TryRegisterLocalPackage(packagePath, currentVersion, architecture);
+        PendingUpdateApplier.FullPackageInspectionResult fullPackageInspection =
+            PendingUpdateApplier.InspectSupportedLocalFullPackage(packagePath, currentVersion, architecture);
+
+        if (fullPackageInspection.IsSupported
+            && !Dialogs.VersionUpdateDialogViewModel.ConfirmFullPackageUpdate(packagePath))
+        {
+            _logger.Information("Dropped full package import canceled by user before registration: {PackagePath}", packagePath);
+            return;
+        }
+
+        var importResult = PendingUpdateApplier.TryRegisterLocalPackage(
+            packagePath,
+            currentVersion,
+            architecture,
+            fullPackageInspection);
         _logger.Information(
             "Dropped zip import result: status={Status}, sourceVersion={SourceVersion}, targetVersion={TargetVersion}",
             importResult.Status,
